@@ -1,5 +1,3 @@
-cd ~/warframe_market_cpp
-cat > .github/workflows/build.yml << 'YAMLEOF'
 name: build
 
 on: [push, workflow_dispatch]
@@ -33,5 +31,3 @@ jobs:
         with:
           name: warframe_app-linux
           path: build/warframe_app
-YAMLEOF
-head -4 .github/workflows/build.yml
