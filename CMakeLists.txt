@@ -8,8 +8,9 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTOUIC ON)
 set(CMAKE_AUTORCC ON)
 
-# Incluir os módulos Widgets e Network do Qt
-find_package(Qt6 COMPONENTS Widgets Network REQUIRED)
+# Widgets e Network para a app; WebSockets para o estado da conta, que o
+# warframe.market só expõe por wss:// (o v2 rejeita o campo num PATCH /me).
+find_package(Qt6 COMPONENTS Widgets Network WebSockets REQUIRED)
 
 add_executable(warframe_app
     main.cpp
@@ -18,4 +19,4 @@ add_executable(warframe_app
 )
 
 # Ligar as bibliotecas do Qt ao executável
-target_link_libraries(warframe_app PRIVATE Qt6::Widgets Qt6::Network)
+target_link_libraries(warframe_app PRIVATE Qt6::Widgets Qt6::Network Qt6::WebSockets)

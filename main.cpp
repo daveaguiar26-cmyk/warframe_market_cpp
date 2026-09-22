@@ -1,6 +1,9 @@
 // main.cpp — wf-market-analytics
 // Refatoração MVC, coluna Rank Max, Ordenação Automática da Página
 // e ligação opcional à conta warframe.market (ver wfmauth.h).
+#include <QFile>
+#include <QDir>
+#include <QTextStream>
 
 #include <QApplication>
 #include <QMainWindow>
@@ -601,6 +604,7 @@ public:
             btnConta->setText("● " + nome);
             btnConta->setToolTip("Clica para terminar sessão");
             estadoConta("sessão iniciada", "#10b981");
+            mostrarEstadoConta(auth->estado());
             atualizarBarraOrdem();
             auth->carregarMinhasOrdens();
         });
@@ -613,6 +617,8 @@ public:
             tabelaOrdens->setRowCount(0);
             estadoConta("sem sessão", "#9ca3af");
             btnRecarregarOrdens->setEnabled(false);
+            comboEstado->setEnabled(false);
+            comboEstado->setCurrentIndex(2);
             desativarAcoes();
         });
 
@@ -620,6 +626,7 @@ public:
             estadoConta(msg, "#ef4444");
             btnConta->setEnabled(true);
             btnRecarregarOrdens->setEnabled(auth->autenticado());
+             comboEstado->setEnabled(auth->autenticado());
             atualizarAcoesOrdem();
         });
 
@@ -633,6 +640,15 @@ public:
                 cachePrecos.remove(chaveAtual(slug));
                 api->recotar(slug);
             }
+        connect(auth, &WfmAuth::estadoAlterado, this, [this](const QString& estado) {
+            mostrarEstadoConta(estado);
+            estadoConta("estado alterado", "#10b981");
+        });
+
+        connect(auth, &WfmAuth::wsLigado, this, [this](bool ligado) {
+            comboEstado->setEnabled(ligado);
+            if (!ligado) estadoConta("ligação de estado caiu", "#f59e0b");
+        });
             auth->carregarMinhasOrdens();
         });
 
@@ -709,6 +725,7 @@ private:
     QLabel* statusLabel;
     QPushButton* refreshBtn;
     QPushButton* btnConta;
+    QComboBox* comboEstado;
     QButtonGroup* filterGroup;
     QTableWidget* table;
     QPushButton* btnAnterior;
@@ -1136,6 +1153,24 @@ private:
         btnConta->setCursor(Qt::PointingHandCursor);
         btnConta->setStyleSheet(estiloBotao());
         btnConta->setToolTip("Iniciar sessão no warframe.market");
+
+        comboEstado = new QComboBox(aba);
+        comboEstado->addItem("Online", "online");
+        comboEstado->addItem("Online in game", "ingame");
+        comboEstado->addItem("Invisible", "invisible");
+        comboEstado->setEnabled(false);
+        comboEstado->setToolTip("Invisible esconde as tuas ordens das listagens");
+        comboEstado->setStyleSheet(
+            "QComboBox { background:#111827; border:1px solid #1f2937; border-radius:8px;"
+            " padding:9px 14px; color:#cbd5e1; font-weight:bold; }");
+                connect(comboEstado, QOverload<int>::of(&QComboBox::activated), this, [this](int i) {
+            const QString novo = comboEstado->itemData(i).toString();
+            if (novo == auth->estado()) return;
+            comboEstado->setEnabled(false);
+            estadoConta("a mudar o estado...", "#9ca3af");
+            auth->alterarStatus(novo);
+        });
+
         connect(btnConta, &QPushButton::clicked, this, &MainWindow::aoClicarConta);
 
         QLabel* titulo = new QLabel("Ordens publicadas na tua conta", aba);
@@ -1155,6 +1190,8 @@ private:
         statusOrdens->setStyleSheet("color:#9ca3af; font-size:12px; font-weight:bold;");
 
         topo->addWidget(btnConta, 0);
+        topo->addWidget(btnConta, 0);
+        topo->addWidget(comboEstado, 0);
         topo->addWidget(titulo, 2);
         topo->addWidget(btnRecarregarOrdens, 0);
         topo->addWidget(statusOrdens, 1);
@@ -1321,7 +1358,20 @@ private:
     }
 
     void mostrarEstadoOrdem(const QString& msg) { estadoConta(msg, "#9ca3af"); }
-
+    void mostrarEstadoConta(const QString& estado) {
+        const int i = comboEstado->findData(estado);
+        if (i >= 0) {
+            QSignalBlocker blk(comboEstado);
+            comboEstado->setCurrentIndex(i);
+        }
+        const QString cor = estado == "ingame" ? "#a78bfa"
+                            : estado == "online" ? "#10b981" : "#9ca3af";
+        comboEstado->setStyleSheet(
+            QString("QComboBox { background:#111827; border:1px solid #1f2937;"
+                    " border-radius:8px; padding:9px 14px; color:%1; font-weight:bold; }")
+                .arg(cor));
+        comboEstado->setEnabled(auth->autenticado());
+    }
     void atualizarAcoesOrdem() {
         const MinhaOrdem* o = ordemSelecionada();
         const bool pronto = auth->autenticado() && o != nullptr;
@@ -1778,6 +1828,11 @@ private:
 
 int main(int argc, char* argv[]) {
     QApplication app(argc, argv);
+        qInstallMessageHandler([](QtMsgType, const QMessageLogContext&, const QString& msg) {
+        QFile f(QDir::homePath() + "/wf-log.txt");
+        if (f.open(QIODevice::Append | QIODevice::Text))
+            QTextStream(&f) << msg << "\n";
+    });
     QCoreApplication::setOrganizationName("wf-market-analytics");
     QCoreApplication::setApplicationName("wf-market-analytics");
     MainWindow window;

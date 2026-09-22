@@ -11,6 +11,7 @@
 #include <QUrl>
 #include <QDebug>
 #include <QTimer>
+#include <QWebSocket>
 
 #ifdef WFM_KEYCHAIN
 #include <qt6keychain/keychain.h>
@@ -22,11 +23,19 @@ namespace {
 const QString kV1 = QStringLiteral("https://api.warframe.market/v1");
 const QString kV2 = QStringLiteral("https://api.warframe.market/v2");
 
+// O estado da conta vive aqui, não no REST.
+const QString kWs = QStringLiteral("wss://ws.warframe.market/socket?platform=pc");
+
 const QByteArray kUserAgent = "wf-market-analytics/6.3 (+o-teu-email@exemplo.pt)";
 const QByteArray kPlataforma = "pc";
 
 // Ritmo do lote: a API aceita 3 pedidos/segundo.
 constexpr int kIntervaloLoteMs = 350;
+
+// O servidor expira o estado ao fim de duration segundos; reenviamos antes
+// disso para o estado não cair sozinho enquanto a app está aberta.
+constexpr int kDuracaoEstado = 3600;
+constexpr int kRefrescoEstadoMs = 50 * 60 * 1000;
 
 #ifdef WFM_KEYCHAIN
 const char* kServicoKeychain = "wf-market-analytics";
@@ -41,6 +50,12 @@ WfmAuth::WfmAuth(QObject* parent) : QObject(parent) {
     m_loteTimer = new QTimer(this);
     m_loteTimer->setInterval(kIntervaloLoteMs);
     connect(m_loteTimer, &QTimer::timeout, this, &WfmAuth::processarLote);
+
+    m_wsRefresco = new QTimer(this);
+    m_wsRefresco->setInterval(kRefrescoEstadoMs);
+    connect(m_wsRefresco, &QTimer::timeout, this, [this]() {
+        if (!m_estadoPedido.isEmpty()) alterarStatus(m_estadoPedido);
+    });
 
     // device_id estável entre arranques. Não é segredo, é só um identificador
     // de cliente que o endpoint de login espera.
@@ -128,17 +143,121 @@ void WfmAuth::entrar(const QString& email, const QString& password) {
         if (m_nome.isEmpty()) m_nome = user.value("ingameName").toString();
         if (m_nome.isEmpty()) m_nome = "sessão iniciada";
 
+        m_estado = user.value("status").toString();
+        if (m_estado.isEmpty()) m_estado = "invisible";
+
         guardarToken();
         emit sessaoIniciada(m_nome);
+        abrirWebSocket();
     });
 }
 
 void WfmAuth::sair() {
+    fecharWebSocket();
     m_token.clear();
     m_nome.clear();
+    m_estado.clear();
     m_esquema = "JWT";
     limparToken();
     emit sessaoTerminada();
+}
+
+// --------------------------------------------- WEBSOCKET DO ESTADO ---------
+//
+// O site autentica-se com um comando (não no handshake) e só depois aceita
+// comandos de estado. As mesmas rotas servem para os eventos que o servidor
+// envia por iniciativa própria — uma mudança feita no site chega aqui.
+
+void WfmAuth::abrirWebSocket() {
+    if (m_ws || m_token.isEmpty()) return;
+
+    m_ws = new QWebSocket();
+    m_ws->setParent(this);
+    m_wsAutenticado = false;
+
+    connect(m_ws, &QWebSocket::connected, this, [this]() {
+        qInfo() << "[ws] ligado, a autenticar";
+        enviarWs("@wfm|cmd/auth/signIn", {{"token", QString::fromUtf8(m_token)}});
+    });
+
+    connect(m_ws, &QWebSocket::textMessageReceived, this, &WfmAuth::aoReceberWs);
+
+    connect(m_ws, &QWebSocket::disconnected, this, [this]() {
+        m_wsAutenticado = false;
+        m_wsRefresco->stop();
+        emit wsLigado(false);
+        qInfo() << "[ws] ligação fechada";
+    });
+
+    connect(m_ws, &QWebSocket::errorOccurred, this, [this](QAbstractSocket::SocketError) {
+        if (m_ws) qWarning().noquote() << "[ws] erro:" << m_ws->errorString();
+    });
+
+    m_ws->open(QUrl(kWs));
+}
+
+void WfmAuth::fecharWebSocket() {
+    m_wsRefresco->stop();
+    m_wsAutenticado = false;
+    m_estadoPedido.clear();
+    if (m_ws) {
+        m_ws->close();
+        m_ws->deleteLater();
+        m_ws = nullptr;
+    }
+}
+
+void WfmAuth::enviarWs(const QString& rota, const QJsonObject& payload) {
+    if (!m_ws || m_ws->state() != QAbstractSocket::ConnectedState) return;
+    QJsonObject msg{{"route", rota}};
+    if (!payload.isEmpty()) msg.insert("payload", payload);
+    m_ws->sendTextMessage(QString::fromUtf8(
+        QJsonDocument(msg).toJson(QJsonDocument::Compact)));
+}
+
+void WfmAuth::aoReceberWs(const QString& texto) {
+    const QJsonObject o = QJsonDocument::fromJson(texto.toUtf8()).object();
+    const QString rota = o.value("route").toString();
+    const QJsonObject payload = o.value("payload").toObject();
+
+    if (rota == "@wfm|cmd/auth/signIn:ok") {
+        m_wsAutenticado = true;
+        emit wsLigado(true);
+        qInfo() << "[ws] autenticado";
+        // Reaplica o estado que o utilizador escolheu antes de a ligação estar pronta.
+        if (!m_estadoPedido.isEmpty()) alterarStatus(m_estadoPedido);
+        return;
+    }
+
+    // Tanto a confirmação do nosso comando como uma mudança feita noutro
+    // sítio (o site, outra sessão) chegam por aqui.
+    if (rota == "@wfm|cmd/status/set:ok" || rota == "@wfm|event/status/set") {
+        const QString novo = payload.value("status").toString();
+        if (!novo.isEmpty() && novo != m_estado) {
+            m_estado = novo;
+            emit estadoAlterado(novo);
+        }
+        if (rota == "@wfm|cmd/status/set:ok") m_wsRefresco->start();
+        return;
+    }
+
+    if (rota.endsWith(":error") || o.contains("error")) {
+        qWarning().noquote() << "[ws] recusado:" << texto.left(300);
+        emit erro("O servidor recusou a mudança de estado.");
+    }
+}
+
+void WfmAuth::alterarStatus(const QString& estado) {
+    if (!autenticado()) { emit erro("Sem sessão iniciada."); return; }
+
+    m_estadoPedido = estado;
+    if (!m_wsAutenticado) {
+        abrirWebSocket();          // aplica-se assim que o signIn:ok chegar
+        return;
+    }
+    enviarWs("@wfm|cmd/status/set", {{"status", estado},
+                                     {"duration", kDuracaoEstado}});
+
 }
 
 // ------------------------------------------------- pedidos autenticados -----
@@ -497,6 +616,7 @@ void WfmAuth::restaurarSessao() {
         m_token = job->textData().toUtf8();
         m_nome = "sessão restaurada";
         emit sessaoIniciada(m_nome);
+        abrirWebSocket();
         carregarMinhasOrdens();   // confirma que o token ainda serve
     });
     job->start();

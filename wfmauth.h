@@ -5,6 +5,10 @@
 // desligado por fases. Quando morrer, é este ficheiro que se substitui — a app
 // principal não sabe nada sobre autenticação além de chamar estes métodos.
 //
+// O estado da conta (online / ingame / invisible) NÃO passa por REST: o site
+// usa um WebSocket próprio para isso, e o v2 rejeita o campo num PATCH /me.
+// Ver abrirWebSocket() e alterarStatus() no .cpp.
+//
 // Opcional: compila com -DWFM_KEYCHAIN e liga qt6keychain para guardar o token
 // no keychain do sistema entre sessões. Sem isso, o token vive só em memória e
 // perde-se ao fechar a app, que é o comportamento mais seguro por omissão.
@@ -25,6 +29,7 @@
 class QNetworkAccessManager;
 class QTimer;
 class QNetworkReply;
+class QWebSocket;
 
 struct MinhaOrdem {
     QString id;
@@ -45,10 +50,15 @@ public:
 
     bool autenticado() const { return !m_token.isEmpty(); }
     QString utilizador() const { return m_nome; }
+    QString estado() const { return m_estado; }   // "ingame" | "online" | "invisible"
 
     // A password é usada no pedido e nunca é guardada, nem em memória.
     void entrar(const QString& email, const QString& password);
     void sair();
+
+    // Muda o estado da conta. Vai por WebSocket; se a ligação ainda não
+    // estiver pronta, o pedido fica guardado e aplica-se assim que estiver.
+    void alterarStatus(const QString& estado);
 
     void criarOrdem(const QString& itemId, const QString& tipo,
                     int platinum, int quantity, int rank, bool visivel);
@@ -82,6 +92,9 @@ signals:
     void loteConcluido(int feitos, int falhas);
     void ordensRecebidas(const QList<MinhaOrdem>& ordens, const QString& endpointUsado);
 
+    void estadoAlterado(const QString& estado);
+    void wsLigado(bool ligado);
+
 private:
     using Callback = std::function<void(const QByteArray& corpo)>;
 
@@ -114,6 +127,12 @@ private:
     void guardarToken();
     void limparToken();
 
+    // --- WebSocket do estado ---
+    void abrirWebSocket();
+    void fecharWebSocket();
+    void enviarWs(const QString& rota, const QJsonObject& payload = {});
+    void aoReceberWs(const QString& texto);
+
     QNetworkAccessManager* m_net = nullptr;
     QByteArray m_token;
     QByteArray m_esquema = "JWT";   // prefixo do cabeçalho Authorization
@@ -128,4 +147,10 @@ private:
     int m_loteFalhas = 0;
     QTimer* m_loteTimer = nullptr;
     bool m_loteEmCurso = false;
+
+    QWebSocket* m_ws = nullptr;
+    QTimer* m_wsRefresco = nullptr;
+    QString m_estado;
+    QString m_estadoPedido;     // guardado para reenviar após reconexão
+    bool m_wsAutenticado = false;
 };
